@@ -1,0 +1,378 @@
+log:
+  level: debug
+  file: ./mosdns.log
+#cooper msdns-gfw,inculd dns server
+api:
+  http: "0.0.0.0:8338"
+
+plugins:
+  - tag: hosts
+    type: hosts
+    args:
+      files: ./hosts.txt
+
+  - tag: cache
+    type: cache
+    args:
+      size: 1024
+      lazy_cache_ttl: 86400
+
+  - tag: adlist
+    type: domain_set
+    args:
+      files: ./rules/ad_domain_list.txt
+
+  - tag: ad_serverlist
+    type: domain_set
+    args:
+      files: ./rules/serverlist.txt
+
+  - tag: local_ptr
+    type: domain_set
+    args:
+      files: ./rules/local-ptr.txt
+
+  - tag: china_domain
+    type: domain_set
+    args:
+      files: ./rules/china_domain_list.txt
+
+  - tag: cdncn_domain
+    type: domain_set
+    args:
+      files: ./rules/cdn_domain_list.txt
+
+  - tag: ecs_cn_domain
+    type: domain_set
+    args:
+      files: ./rules/ecs_cn_domain.txt
+
+  - tag: gfwlist
+    type: domain_set
+    args:
+      files: ./rules/gfw_domain_list.txt
+
+  - tag: geosite_no_cn
+    type: domain_set
+    args:
+      files: ./rules/geosite_no_cn.txt
+
+  - tag: local_ip
+    type: ip_set
+    args:
+      files: ./rules/china_ip_list.txt
+
+  - tag: gfw_ip
+    type: ip_set
+    args:
+      files: ./rules/gfw_ip_list.txt
+
+  - tag: ecs_tw
+    type: ecs_handler
+    args:
+      forward: false
+      preset: 168.95.1.0
+      send: false
+      mask4: 24
+      mask6: 48
+
+  - tag: rate_limit
+    type: rate_limiter
+    args:
+      qps: 20
+      burst: 40
+      mask4: 32
+      mask6: 48
+
+  - tag: forward_local
+    type: forward
+    args:
+      concurrent: 3
+      upstreams:
+        - addr: https://sm2.doh.pub/dns-query
+          dial_addr: 106.55.91.174:443
+        - addr: quic://223.5.5.5
+        - addr: 180.184.1.1
+
+  - tag: forward_remote
+    type: forward
+    args:
+      concurrent: 2
+      upstreams:
+        - addr: https://101.101.101.101/dns-query
+        - addr: https://doh.apad.pro/dns-query
+          bootstrap: 119.29.29.29
+
+  - tag: local_sequence
+    type: sequence
+    args:
+      - exec: $forward_local
+      - matches:
+        - "!resp_ip $local_ip"
+        exec: drop_resp
+
+  - tag: noleak_sequence
+    type: sequence
+    args:
+      - exec: prefer_ipv4
+      - exec: $ecs_tw
+      - exec: $forward_remote
+      - matches: "resp_ip $local_ip"
+        exec: $forward_local
+
+  - tag: remote_sequence
+    type: sequence
+    args:
+      - exec: prefer_ipv4
+      - exec: $ecs_tw
+      - exec: $forward_remote
+      - matches: "resp_ip $gfw_ip"
+        exec: drop_resp
+
+  - tag: has_wanted_ans_sequence
+    type: sequence
+    args:
+      - matches: has_wanted_ans
+        exec: accept
+
+  - tag: fallback
+    type: fallback
+    args:
+      primary: noleak_sequence
+      secondary: remote_sequence
+      threshold: 500
+      always_standby: false
+
+  - tag: main_sequence
+    type: sequence
+    args:
+      - matches: "!$rate_limit"
+        exec: reject 3
+
+      - exec: $hosts
+      - exec: jump has_wanted_ans_sequence
+
+      - matches: qtype 12 65 255
+        exec: reject 0
+
+      - matches:
+          - "!qname $adlist"
+          - "!qname $ad_serverlist"
+          - "!qname $local_ptr"
+        exec: $cache
+      - exec: jump has_wanted_ans_sequence
+
+      - matches: qname $china_domain $cdncn_domain $ecs_cn_domain
+        exec: $local_sequence
+      - exec: jump has_wanted_ans_sequence
+
+      - matches: qname $geosite_no_cn $gfwlist
+        exec: $remote_sequence
+      - exec: jump has_wanted_ans_sequence
+
+      - exec: $fallback
+
+  - tag: udp_server
+    type: udp_server
+    args:
+      entry: main_sequence
+      listen: 127.0.0.1:5353
+
+  - tag: tcp_server
+    type: tcp_server
+    args:
+      entry: main_sequence
+      listen: 127.0.0.1:5353
+
+  - tag: reject_3
+    type: reject
+    args:
+      code: 3
+
+  - tag: reject_null_domain
+    type: sequence
+    args:
+      - exec: query_summary reject_null_domain
+      - exec: reject_3
+
+  - tag: reject_qtype65
+    type: sequence
+    args:
+      - exec: query_summary reject_qtype65
+      - exec: reject_3
+
+  - tag: reject_ad
+    type: sequence
+    args:
+      - exec: query_summary reject_adlist
+      - exec: reject_3
+
+  - tag: quad9
+    type: forward
+    args:
+      upstreams:
+        - addr: tls://9.9.9.9
+        - addr: tls://149.112.112.112
+
+  - tag: nextdns
+    type: forward
+    args:
+      upstreams:
+        - addr: tls://45.90.28.0
+        - addr: tls://45.90.30.0
+
+  - tag: dns_nocn
+    type: fallback
+    args:
+      primary: quad9
+      secondary: nextdns
+      threshold: 700
+      always_standby: true
+
+  - tag: dns_cn
+    type: fallback
+    args:
+      primary: ali
+      secondary: dnspod
+      threshold: 500
+      always_standby: true
+
+  - tag: dns_nocn_seq
+    type: sequence
+    args:
+      - exec: query_summary dns_nocn
+      - exec: $dns_nocn
+
+  - tag: dns_cn_seq
+    type: sequence
+    args:
+      - exec: query_summary dns_cn
+      - exec: $dns_cn
+
+  - tag: local_seq
+    type: sequence
+    args:
+      - exec: query_summary local
+      - exec: $local
+
+  - tag: fallback_seq
+    type: sequence
+    args:
+      - exec: query_summary fallback
+      - exec: $dns_cn
+
+  - tag: other_seq
+    type: sequence
+    args:
+      - exec: query_summary other
+      - exec: $dns_cn
+
+  - tag: query_cn
+    type: sequence
+    args:
+      - exec: $ecs_cn
+      - exec: $dns_cn_seq
+      - matches: "!resp_ip $geoip_cn"
+        exec: drop_resp
+
+  - tag: query_nocn
+    type: sequence
+    args:
+      - exec: $no_ecs
+      - exec: prefer_ipv4
+      - exec: $dns_nocn_seq
+      - matches: "resp_ip $geoip_cn"
+        exec: drop_resp
+
+  - tag: query_gfw
+    type: sequence
+    args:
+      - exec: $forward_remote
+
+  - tag: query_fallback
+    type: sequence
+    args:
+      - exec: prefer_ipv4
+      - exec: $fallback_seq
+
+  - tag: query_lan
+    type: sequence
+    args:
+      - exec: $cache_lan
+      - matches: has_resp
+        exec: return
+      - exec: $local_seq
+
+  - tag: query_other
+    type: sequence
+    args:
+      - exec: $other_seq
+
+  - tag: pre_handle
+    type: sequence
+    args:
+      - exec: $ttl_1h
+      - exec: accept
+
+  - tag: main_handle
+    type: sequence
+    args:
+      - exec: $ttl_5m
+      - exec: accept
+
+  - tag: has_resp_pre
+    type: sequence
+    args:
+      - matches: has_resp
+        exec: goto pre_handle
+
+  - tag: has_resp_main
+    type: sequence
+    args:
+      - matches: has_resp
+        exec: goto main_handle
+
+  - tag: pre_sequence
+    type: sequence
+    args:
+      - matches: qtype 65
+        exec: $reject_qtype65
+      - matches: "qname keyword::"
+        exec: $reject_null_domain
+      - matches: qtype 12
+        exec: $query_other
+      - matches: qtype 255
+        exec: $query_other
+      - matches: ptr_ip $geoip_private
+        exec: $query_lan
+      - exec: jump has_resp_pre
+
+  - tag: main_sequence
+    type: sequence
+    args:
+      - matches: qname $geosite_ads-all
+        exec: $reject_ad
+      - exec: $cache_wan
+      - exec: jump has_resp_main
+      - matches: qname $geosite_cn
+        exec: $query_cn
+      - exec: jump has_resp_main
+      - matches: qname $geosite_gfw
+        exec: $query_gfw
+      - exec: jump has_resp_main
+      - matches: qname $geosite_location-!cn
+        exec: $query_nocn
+      - exec: jump has_resp_main
+      - exec: $no_ecs
+      - exec: $query_fallback
+      - exec: jump has_resp_main
+
+  - type: udp_server
+    args:
+      entry: sequence
+      listen: :5333
+
+  - type: tcp_server
+    args:
+      entry: sequence
+      listen: :5333
