@@ -220,7 +220,20 @@ plugins:
       upstreams:
         - addr: tls://45.90.28.0
         - addr: tls://45.90.30.0
+  - tag: quad9
+    type: forward
+    args:
+      concurrent: 3
+      upstreams:
+        - addr: https://dns9.quad9.net/dns-query
 
+  - tag: dns_nocn
+    type: "fallback"
+    args:
+      primary: quad9
+      secondary: nextdns
+      threshold: 700
+      always_standby: true
   - tag: dns_nocn
     type: fallback
     args:
